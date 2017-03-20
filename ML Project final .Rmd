@@ -1,0 +1,279 @@
+---
+title: "Machine Learning Peoject - 2 Sigma rental listing inquiries"
+author: "Yirong Song"
+date: "3/15/2017"
+output: html_document
+---
+
+```{r}
+setwd("~/desktop/Winter/ML/2Sigma/Data")
+```
+
+```{r}
+library(rjson)
+library(tidyr)
+library(tm)
+library(nnet)
+library(stringr)
+library(dplyr)
+library(purrr)
+library(e1071)
+library(wordcloud)
+library(RColorBrewer)
+library(xgboost)
+library(rpart)
+library(tree)
+library(randomForest)
+```
+
+```{r}
+data = fromJSON(file='train.json')
+vars <- setdiff(names(data), c("features", "photos"))
+data <- map_at(data, vars, unlist) %>% 
+  tibble::as_tibble(.) %>%
+  mutate(interest_level = factor(interest_level, c("low", "medium", "high")))
+
+training = data[,c(9,1:2,7:8,10,13,15)]
+```
+
+```{r}
+# seperate Training data to sample + holdout
+idx = seq(1,length(training$listing_id))
+train_idx = sample(idx,44000)
+holdout_idx = setdiff(idx,train_idx)
+x_train = training[train_idx,c(1:3,5:7)]
+x_holdout= training[holdout_idx,c(1:3,5:7)]
+y_train = training[train_idx,8]
+y_holdout = training[holdout_idx,8]
+
+training_train = cbind(x_train,'interest_level' = y_train)
+training_holdout = cbind(x_holdout, 'interest_level' = y_holdout)
+```
+
+```{r}
+# Nomalize data 
+training_train_nom = as.data.frame(scale(training_train[,1:6]))
+training_train_nom = cbind(training_train_nom,'interest_level' = training_train$interest_level)
+
+training_holdout_nom = as.data.frame(scale(training_holdout[,1:6]))
+training_holdout_nom = cbind(training_holdout_nom,'interest_level' = training_holdout$interest_level)
+```
+
+#### 1. Base Line
+```{r}
+# Running multi-logit model on only numerical x variables as baseline 
+attach(training_train_nom)
+model = multinom(interest_level~bathrooms+bedrooms+latitude+longitude+price,data=training_train_nom)
+summary(model)
+head(model$fitted.values)
+fit = predict(model)
+
+# test the perfomance of the model on trainning data  
+print(table(training_train_nom$interest_level,fit))
+# test the perfomance of the model on holdout data
+fit_2 = predict(model,newdata = training_holdout_nom )
+print(table(training_holdout_nom$interest_level,fit_2))
+```
+
+##### 2. Regression Tree
+```{r}
+#Clean data before running regression tree:
+data_plot = subset(training, training$latitude!= 0)
+data_plot_1 = subset(data_plot, data_plot$longitude < -73.7 & data_plot$longitude > -74.2)
+
+lat = as.matrix(data_plot_1$latitude)
+lon = as.matrix(data_plot_1$longitude)
+
+price_1 = as.matrix(data_plot_1$price)
+
+price.deciles = quantile(price_1,0:10/10)
+
+cut.prices = cut(price_1,price.deciles,include.lowest=TRUE)
+
+#Regression Trees: Price on latitude and longitude
+logprice = log(price_1)
+summary(lm(price_1~lat+lon))
+
+fit = tree(logprice~lon+lat)
+plot(fit)
+text(fit,cex=0.8)
+
+#Plot in map
+plot(lon, lat, col=brewer.pal(3,"RdYlBu"),pch=20,xlab="Longitude",ylab="Latitude")
+partition.tree(fit,ordvars=c("lon","lat"),add=TRUE,cex=0.8)
+```
+
+#### 3. Classification Tree
+```{r}
+df=training
+
+#Levels: Low & Med+High 
+df$class_lm<-ifelse(df$interest_level=="low","low","med-high")
+fit_lm = rpart(class_lm~price+bathrooms+bedrooms+latitude+longitude, method="class", data=df)
+printcp(fit_lm)
+plot(fit_lm, uniform=TRUE)
+text(fit_lm, use.n=TRUE, all=TRUE, cex=0.8)
+
+#Levels: Med & High
+mh = subset(training, training$interest_level != "low")
+fit_mh = rpart(interest_level~price+bathrooms+bedrooms+latitude+longitude, method="class", data=mh)
+printcp(fit_mh)
+plot(fit_mh, uniform=TRUE)
+text(fit_mh, use.n=TRUE, all=TRUE, cex=0.8)
+```
+
+#### 4. Random Forest 
+```{r}
+data_RM = training_train[,c(2:3,6:7)]
+
+model_2 <- randomForest(interest_level ~ ., data = data_RM)
+pred <- predict(model_2, newdata = training_train)
+table(training_train$interest_level,pred)
+
+pred_2 = predict(model_2,newdata = training_holdout)
+table(training_holdout$interest_level,pred_2)
+```
+
+
+# loop to get the "features" tidy table 
+feature_tbl = data_frame('listing_id'= numeric(), 'features' = character(), 'interest_level' = factor())
+loop_data = data[,c(9,7,15)]
+
+for (i in 1:length(loop_data$listing_id)){
+  p = unlist(loop_data[i,2], ",")
+  if (is.null(p)==TRUE){feature_tbl = feature_tbl}
+  else {
+  q = data.frame('listing_id' = loop_data[i,1], 'features' = paste0(p), 'interest_level' = loop_data[i,3])
+  feature_tbl = rbind(feature_tbl,q)}
+}
+
+print(head(feature_tbl,10))
+
+write.csv(feature_tbl,'features.csv')
+
+
+```{r}
+#seperate data with 3 interest levels 
+feature_tbl = read.csv("feature.csv")
+high = subset(feature_tbl,interest_level == 'high')
+medium = subset(feature_tbl,interest_level== 'medium')
+low = subset(feature_tbl,interest_level == 'low')
+```
+
+```{r}
+# wordclouds_high
+high_ctext = Corpus(VectorSource(high$features))
+high_tdm = TermDocumentMatrix(high_ctext)
+high_TDM = as.matrix(high_tdm)
+wordcount_high = sort(rowSums(high_TDM),decreasing=TRUE)
+tdm_names_high = names(wordcount_high)
+wordcloud(tdm_names_high,wordcount_high,max.words = 51,colors=brewer.pal(6, "Spectral"))
+```
+
+```{r}
+# wordclouds_medium 
+medium_ctext = Corpus(VectorSource(medium$features))
+medium_tdm = TermDocumentMatrix(medium_ctext)
+medium_TDM = as.matrix(medium_tdm)
+wordcount_medium = sort(rowSums(medium_TDM),decreasing=TRUE)
+tdm_names_medium = names(wordcount_medium)
+wordcloud(tdm_names_medium,wordcount_medium,max.words = 51,colors=brewer.pal(6, "Spectral"))
+```
+
+```{r}
+# wordclouds_low
+low_ctext = Corpus(VectorSource(low$features))
+low_tdm = TermDocumentMatrix(low_ctext)
+low_TDM = as.matrix(low_tdm)
+wordcount_low = sort(rowSums(low_TDM),decreasing=TRUE)
+tdm_names_low = names(wordcount_low)
+wordcloud(tdm_names_low,wordcount_low,max.words = 50,colors=brewer.pal(6, "Spectral"))
+```
+
+```{r}
+feature_dummy = data$features
+z = function(feature_dummy){gsub(" ","_",feature_dummy)}
+feature_dummy = sapply(feature_dummy,z)
+feature_ctext = Corpus(VectorSource(feature_dummy))
+feature_tdm = TermDocumentMatrix(feature_ctext)
+feature_TDM = as.matrix(feature_tdm)
+cluster_data = t(feature_TDM)
+```
+
+#### 5. Naive Bayes model 
+```{r}
+# Naive Bayes model 
+res_nb = naiveBayes(cluster_data,data$interest_level)
+fit_nb = predict(res_nb,cluster_data)
+print(table(fit_nb,data$interest_level))
+
+confMat2 <- table(data$interest_level,fit_nb)
+accuracy2 <- (diag(confMat2))/rowSums(confMat2)
+print(accuracy2)
+```
+
+#### Reading test data 
+```{r}
+data_test = fromJSON(file='test.json')
+vars_test <- setdiff(names(data_test), c("features", "photos"))
+data_test <- map_at(data_test, vars_test, unlist) %>% 
+  tibble::as_tibble(.)
+```
+
+#### Run the best model we had to predict interest level 
+```{r}
+testing = data_test[,c(9,1:2,13)]
+res_test = predict(model_2,newdata = testing)
+head(res_test)
+predict_test = data.frame(testing$listing_id,'interest_level' = res_test)
+head(predict_test)
+```
+
+#### Plot distance density by interest_level
+```{r}
+data_plot = subset(training, training$latitude!= 0)
+data_plot_1 = subset(data_plot, data_plot$longitude < -73.7 & data_plot$longitude > -74.2)
+
+lat = as.matrix(data_plot_1$latitude)
+lon = as.matrix(data_plot_1$longitude)
+
+data_plot_2 <- data_plot_1
+```
+
+```{r}
+# New York City Center Coords
+ny_center <- geocode("new york", source = "google")
+ny_lat <- 40.785091
+ny_lon <- -73.968285
+
+data_plot_2$distance_city <-mapply(function(lon, lat) sqrt((lon - ny_lon)^2+ (lat - ny_lat)^2),
+data_plot_2$longitude,data_plot_2$latitude) 
+
+ny_outliners_dist <- 0.2
+
+ggplot(data_plot_2[data_plot_2$distance_city < ny_outliners_dist, ],aes(distance_city, color = interest_level)) +geom_density()
+```
+
+#### NY map with plot about interest level  
+```{r}
+map <- get_googlemap(
+  zoom = 12,
+  center = ny_center %>% as.numeric,
+  maptype = "satellite",
+  sensor = FALSE)
+
+## satellite
+p1 <- ggmap(map) + geom_point(aes(x = lon, y = lat, color = interest_level), alpha = 0.1, size = 2, data = data_plot_1) + scale_color_manual(name = "qsec", values = c("low" = "blue","medium" = "green","high" = "red"))
+p1
+
+## roadmap
+map <- get_googlemap(
+  zoom = 12,
+  center = ny_center %>% as.numeric,
+  maptype = "roadmap",
+  sensor = FALSE)
+
+p2 <- ggmap(map) + geom_point(aes(x = lon, y = lat, color = interest_level), alpha = 0.1, size = 2, data = data_plot_1) + scale_color_manual(name = "qsec", values = c("low" = "blue","medium" = "green","high" = "red"))
+p2
+```
+
